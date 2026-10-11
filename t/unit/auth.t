@@ -10,8 +10,11 @@ like $hash, qr/^\$2b\$12\$/, 'writes bcrypt hashes accepted by the Python backen
 ok check_password('correct horse', $hash), 'accepts matching password';
 ok !check_password('wrong horse', $hash), 'rejects wrong password';
 ok !check_password('correct horse', 'not-a-bcrypt-hash'), 'rejects malformed stored hash';
+ok check_password('password', '$2b$12$abcdefghijklmnopqrstuutwZ1IOTtu3SsEBT5lI/LFncP31tIybm'),
+    'verifies a pre-existing bcrypt modular hash';
 my $token = new_token();
 like $token, qr/\A[A-Za-z0-9_-]{54}\z/, 'token is URL-safe and has 40 random bytes';
 is length(new_token()), 54, 'token length is stable';
+isnt new_token(), new_token(), 'tokens use fresh random bytes';
 like utc_after(3600), qr/\A\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\z/, 'expiry is SQL datetime format';
 done_testing;

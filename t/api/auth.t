@@ -63,6 +63,8 @@ $t->post_ok('/auth' => form => {grant_type => 'password', username => 'person@ex
 my $first = $t->tx->res->json;
 $t->post_ok('/auth' => form => {grant_type => 'password', username => 'person@example.test', password => 'bad'})
   ->status_is(400)->json_is('/error' => 'unauthorized_client');
+$t->post_ok('/auth' => form => {grant_type => 'password', username => q{' OR 1=1 --}, password => 'good-password'})
+  ->status_is(400)->json_is('/error' => 'unauthorized_client');
 $t->post_ok('/auth' => form => {grant_type => 'password', username => 'disabled@example.test', password => 'good-password'})
   ->status_is(400)->json_is('/error' => 'account_disabled');
 $t->get_ok('/logout' => {Authorization => "Bearer $first->{access_token}"})->status_is(204);
