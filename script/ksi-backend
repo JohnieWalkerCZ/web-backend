@@ -1,0 +1,10 @@
+#!/usr/bin/env perl
+
+use v5.36;
+use strict;
+use warnings;
+use FindBin qw($Bin);
+use lib "$Bin/../lib";
+use KSI::App;
+
+KSI::App->new->start;
