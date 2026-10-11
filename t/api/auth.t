@@ -94,6 +94,9 @@ $t->delete_ok('/waves/11' => {Authorization => "Bearer $admin->{access_token}"})
 $t->post_ok('/years' => {Authorization => "Bearer $admin->{access_token}"} => json => {year => {index => 2026, year => '2026/2027', sealed => 0, point_pad => 0, active_orgs => [7]}})
   ->status_is(200)->json_is('/year/index' => 2026)->json_is('/year/sum_points' => 0);
 $t->get_ok('/years/2026')->status_is(200)->json_is('/year/tasks_cnt' => 0);
+$t->put_ok('/years/2026' => {Authorization => "Bearer $admin->{access_token}"} => json => {year => {index => 2027, year => '2027/2028', sealed => 1, point_pad => 2.5, active_orgs => [9]}})
+  ->status_is(200)->json_is('/year/index' => 2027)->json_is('/year/sealed' => 1);
+$t->get_ok('/years/2027')->status_is(200)->json_is('/year/point_pad' => 2.5);
 $t->delete_ok('/years/2025' => {Authorization => "Bearer $admin->{access_token}"})->status_is(403);
-$t->delete_ok('/years/2026' => {Authorization => "Bearer $admin->{access_token}"})->status_is(200)->json_is({});
+$t->delete_ok('/years/2027' => {Authorization => "Bearer $admin->{access_token}"})->status_is(200)->json_is({});
 done_testing;

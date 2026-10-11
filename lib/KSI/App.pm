@@ -120,6 +120,36 @@ sub startup ($self) {
         return $c->rendered(404) unless $year;
         return $c->render(json => {year => $year});
     });
+    $r->put('/years/:id')->to(cb => sub ($c) {
+        return $c->rendered(400) unless _admin($c);
+        my $id = $c->param('id');
+        return $c->rendered(404) unless $id =~ /\A\d+\z/;
+        my $body = $c->req->json;
+        my $data = ref($body) eq 'HASH' ? $body->{year} : undef;
+        return $c->rendered(400) unless ref($data) eq 'HASH'
+            && defined $data->{index} && defined $data->{year}
+            && exists $data->{sealed} && defined $data->{point_pad}
+            && ref($data->{active_orgs}) eq 'ARRAY';
+        my $dbh = $c->db;
+        return $c->rendered(404) unless $dbh->selectrow_array('SELECT 1 FROM years WHERE id = ?', undef, $id);
+        eval {
+            $dbh->begin_work;
+            $dbh->do('DELETE FROM active_orgs WHERE year = ?', undef, $id);
+            $dbh->do('UPDATE years SET id = ?, year = ?, sealed = ?, point_pad = ? WHERE id = ?',
+                undef, @$data{qw(index year sealed point_pad)}, $id);
+            for my $org (@{$data->{active_orgs}}) {
+                $dbh->do('INSERT INTO active_orgs (org, year) VALUES (?, ?)', undef, $org, $data->{index});
+            }
+            $dbh->commit;
+            1;
+        } or do {
+            my $error = $@ || 'Year update failed';
+            eval { $dbh->rollback };
+            die $error;
+        };
+        my ($year) = grep { $_->{id} == $data->{index} } @{_years($c)};
+        return $c->render(json => {year => $year});
+    });
     $r->post('/years')->to(cb => sub ($c) {
         return $c->rendered(400) unless _admin($c);
         my $body = $c->req->json;
