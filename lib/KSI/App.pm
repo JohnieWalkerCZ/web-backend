@@ -28,6 +28,14 @@ sub startup ($self) {
         return if !defined $token->{expire} || $token->{expire} lt $now;
         $c->stash(user => $token);
     });
+    $self->hook(before_dispatch => sub ($c) {
+        return if $c->req->method eq 'OPTIONS';
+        my $year = $c->req->headers->header('Year');
+        if (!defined $year) {
+            ($year) = $c->db->selectrow_array('SELECT id FROM years ORDER BY id DESC LIMIT 1');
+        }
+        $c->stash(year => $year);
+    });
 
     my $r = $self->routes;
     $r->post('/auth')->to(cb => sub ($c) {
@@ -146,6 +154,19 @@ sub startup ($self) {
         $dbh->do('DELETE FROM years WHERE id = ?', undef, $id);
         return $c->render(json => {});
     });
+    $r->get('/waves')->to(cb => sub ($c) {
+        my $waves = _waves($c, $c->stash('year'));
+        my $user = $c->stash('user') // {};
+        $waves = [grep { $_->{public} || ($user->{role} // '') =~ /\A(?:admin|org|tester)\z/ } @$waves];
+        return $c->render(json => {waves => $waves});
+    });
+    $r->get('/waves/:id')->to(cb => sub ($c) {
+        my $id = $c->param('id');
+        return $c->rendered(404) unless $id =~ /\A\d+\z/;
+        my ($wave) = @{_waves($c, undef, $id)};
+        return $c->rendered(404) unless $wave;
+        return $c->render(json => {wave => $wave});
+    });
 }
 
 sub _admin ($c) {
@@ -176,6 +197,33 @@ sub _years ($c) {
         +{id => 0 + $_->{id}, index => 0 + $_->{id}, year => $_->{year},
           sum_points => 0 + $_->{sum_points}, tasks_cnt => 0 + $_->{tasks_cnt},
           sealed => $_->{sealed} ? 1 : 0, point_pad => 0 + $_->{point_pad}}
+    } @$rows];
+}
+
+sub _waves ($c, $year, $id = undef) {
+    return [] unless defined $year || defined $id;
+    my $sql = q{
+        SELECT w.id, w.year, w.`index` AS wave_index, w.caption, w.garant,
+               w.time_published,
+               COALESCE(SUM(pt.points), 0) AS sum_points,
+               COUNT(t.id) AS tasks_cnt
+        FROM waves w
+        LEFT JOIN tasks t ON t.wave = w.id
+        LEFT JOIN (
+            SELECT task, SUM(max_points) AS points
+            FROM modules WHERE bonus = 0 GROUP BY task
+        ) pt ON pt.task = t.id
+    };
+    $sql .= defined $id ? ' WHERE w.id = ?' : ' WHERE w.year = ?';
+    $sql .= ' GROUP BY w.id';
+    my $rows = $c->db->selectall_arrayref($sql, {Slice => {}}, defined $id ? $id : $year);
+    my $now = strftime('%Y-%m-%d %H:%M:%S', localtime);
+    return [map {
+        my $public = ($_->{time_published} // '') lt $now ? 1 : 0;
+        +{id => 0 + $_->{id}, year => 0 + $_->{year}, index => 0 + $_->{wave_index},
+          caption => $_->{caption}, garant => 0 + $_->{garant},
+          time_published => $_->{time_published}, public => $public,
+          sum_points => 0 + $_->{sum_points}, tasks_cnt => 0 + $_->{tasks_cnt}}
     } @$rows];
 }
 
