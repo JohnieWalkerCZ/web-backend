@@ -237,10 +237,81 @@ sub startup ($self) {
         $c->db->do('DELETE FROM waves WHERE id = ?', undef, $id);
         return $c->render(json => {});
     });
+    $r->get('/achievements')->to(cb => sub ($c) {
+        my $rows = $c->db->selectall_arrayref(
+            'SELECT id, title, picture, description, year FROM achievements WHERE year IS NULL OR year = ? ORDER BY id',
+            {Slice => {}}, $c->stash('year') // 0);
+        return $c->render(json => {achievements => [map {_achievement_json($_)} @$rows]});
+    });
+    $r->get('/achievements/special/successful')->to(cb => sub ($c) {
+        my ($id) = $c->db->selectrow_array(
+            q{SELECT value FROM config WHERE key = 'successful_participant_trophy_id'}
+        );
+        return $c->rendered(404) unless defined $id;
+        return _get_achievement($c, $id);
+    });
+    $r->get('/achievements/:id')->to(cb => sub ($c) {
+        return _get_achievement($c, $c->param('id'));
+    });
+    $r->post('/achievements')->to(cb => sub ($c) {
+        return $c->rendered(400) unless _org($c);
+        my $body = $c->req->json;
+        my $data = ref($body) eq 'HASH' ? $body->{achievement} : undef;
+        return $c->rendered(400) unless ref($data) eq 'HASH'
+            && defined $data->{title} && defined $data->{picture} && exists $data->{persistent};
+        my $year = $data->{persistent} ? undef : $c->stash('year');
+        $c->db->do('INSERT INTO achievements (title, picture, description, year) VALUES (?, ?, ?, ?)',
+            undef, @$data{qw(title picture description)}, $year);
+        my $id = $c->db->last_insert_id(undef, undef, 'achievements', 'id');
+        my $row = $c->db->selectrow_hashref('SELECT id, title, picture, description, year FROM achievements WHERE id = ?', undef, $id);
+        return $c->render(json => {achievement => _achievement_json($row)});
+    });
+    $r->put('/achievements/:id')->to(cb => sub ($c) {
+        return $c->rendered(400) unless _org($c);
+        my $body = $c->req->json;
+        my $data = ref($body) eq 'HASH' ? $body->{achievement} : undef;
+        return $c->rendered(400) unless ref($data) eq 'HASH'
+            && defined $data->{title} && defined $data->{picture} && exists $data->{persistent};
+        my $id = $c->param('id');
+        return $c->rendered(404) unless $id =~ /\A\d+\z/;
+        return $c->rendered(404) unless $c->db->selectrow_array('SELECT 1 FROM achievements WHERE id = ?', undef, $id);
+        my $year = $data->{persistent} ? undef : $c->stash('year');
+        $c->db->do('UPDATE achievements SET title = ?, picture = ?, description = ?, year = ? WHERE id = ?',
+            undef, @$data{qw(title picture description)}, $year, $id);
+        return _get_achievement($c, $id);
+    });
+    $r->delete('/achievements/:id')->to(cb => sub ($c) {
+        return $c->rendered(400) unless _admin($c);
+        my $id = $c->param('id');
+        return $c->rendered(404) unless $id =~ /\A\d+\z/;
+        return $c->rendered(404) unless $c->db->selectrow_array('SELECT 1 FROM achievements WHERE id = ?', undef, $id);
+        $c->db->do('DELETE FROM achievements WHERE id = ?', undef, $id);
+        return $c->render(json => {});
+    });
 }
 
 sub _admin ($c) {
     return (($c->stash('user') // {})->{role} // '') eq 'admin';
+}
+
+sub _org ($c) {
+    return (($c->stash('user') // {})->{role} // '') =~ /\A(?:admin|org)\z/;
+}
+
+sub _get_achievement ($c, $id) {
+    return $c->rendered(404) unless defined $id && $id =~ /\A\d+\z/;
+    my $row = $c->db->selectrow_hashref(
+        'SELECT id, title, picture, description, year FROM achievements WHERE id = ?', undef, $id
+    );
+    return $c->rendered(404) unless $row;
+    return $c->render(json => {achievement => _achievement_json($row)});
+}
+
+sub _achievement_json ($row) {
+    return {id => 0 + $row->{id}, title => $row->{title}, active => Mojo::JSON->true,
+        picture => $row->{picture}, description => $row->{description},
+        persistent => defined $row->{year} ? Mojo::JSON->false : Mojo::JSON->true,
+        year => defined $row->{year} ? 0 + $row->{year} : undef};
 }
 
 sub _years ($c) {

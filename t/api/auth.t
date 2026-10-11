@@ -36,6 +36,11 @@ $dbh->do(q{CREATE TABLE modules (
     id INTEGER PRIMARY KEY, task INTEGER NOT NULL, max_points REAL, bonus INTEGER NOT NULL DEFAULT 0
 )});
 $dbh->do(q{CREATE TABLE active_orgs (org INTEGER NOT NULL, year INTEGER NOT NULL, PRIMARY KEY (org, year))});
+$dbh->do(q{CREATE TABLE achievements (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, picture TEXT NOT NULL,
+    description TEXT, year INTEGER
+)});
+$dbh->do(q{CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT, secret INTEGER NOT NULL DEFAULT 0)});
 $dbh->do('INSERT INTO users (id, email, password, enabled) VALUES (?, ?, ?, ?)',
     undef, 7, 'person@example.test', hash_password('good-password'), 1);
 $dbh->do('INSERT INTO users (id, email, password, enabled) VALUES (?, ?, ?, ?)',
@@ -99,4 +104,15 @@ $t->put_ok('/years/2026' => {Authorization => "Bearer $admin->{access_token}"} =
 $t->get_ok('/years/2027')->status_is(200)->json_is('/year/point_pad' => 2.5);
 $t->delete_ok('/years/2025' => {Authorization => "Bearer $admin->{access_token}"})->status_is(403);
 $t->delete_ok('/years/2027' => {Authorization => "Bearer $admin->{access_token}"})->status_is(200)->json_is({});
+$t->post_ok('/achievements' => {Authorization => "Bearer $admin->{access_token}"} => json => {achievement => {title => 'Prize', picture => 'prize.svg', description => 'Test', persistent => 0}})
+  ->status_is(200)->json_is('/achievement/title' => 'Prize')->json_is('/achievement/year' => 2025);
+my $achievement = $t->tx->res->json->{achievement};
+$dbh = DBI->connect("dbi:SQLite:dbname=$dbfile", '', '', {RaiseError => 1});
+$dbh->do('INSERT INTO config (key, value) VALUES (?, ?)', undef, 'successful_participant_trophy_id', $achievement->{id});
+$dbh->disconnect;
+$t->get_ok('/achievements/special/successful')->status_is(200)->json_is('/achievement/id' => $achievement->{id});
+$t->put_ok('/achievements/' . $achievement->{id} => {Authorization => "Bearer $admin->{access_token}"} => json => {achievement => {title => 'Persistent Prize', picture => 'prize.svg', description => 'Test', persistent => 1}})
+  ->status_is(200)->json_is('/achievement/persistent' => 1)->json_is('/achievement/year' => undef);
+$t->get_ok('/achievements')->status_is(200)->json_is('/achievements/0/title' => 'Persistent Prize');
+$t->delete_ok('/achievements/' . $achievement->{id} => {Authorization => "Bearer $admin->{access_token}"})->status_is(200)->json_is({});
 done_testing;
