@@ -14,10 +14,18 @@ my $dbfile = "$dir/test.sqlite";
 $ENV{SQL_ALCHEMY_URI} = "sqlite:///$dbfile";
 $ENV{MOJO_SECRET} = 'test-only-secret';
 $ENV{KSI_CONTENT_ROOT} = "$dir/content";
+$ENV{KSI_TASK_CONTENT_ROOT} = "$dir/task-content";
 make_path("$dir/content/articles/1");
+make_path("$dir/task-content/100/zadani");
 open my $content_file, '>', "$dir/content/articles/1/example.txt" or die $!;
 print {$content_file} "content\n";
 close $content_file;
+open my $task_file, '>', "$dir/task-content/100/zadani/problem.txt" or die $!;
+print {$task_file} "problem\n";
+close $task_file;
+open my $upload_file, '>', "$dir/upload.txt" or die $!;
+print {$upload_file} "uploaded\n";
+close $upload_file;
 my $dbh = DBI->connect("dbi:SQLite:dbname=$dbfile", '', '', {RaiseError => 1});
 $dbh->do(q{CREATE TABLE users (
     id INTEGER PRIMARY KEY, email VARCHAR(50) UNIQUE NOT NULL,
@@ -201,4 +209,13 @@ my $other = $t->tx->res->json;
 $t->delete_ok('/posts/1' => {Authorization => "Bearer $other->{access_token}"})->status_is(403);
 $t->put_ok('/posts/1' => {Authorization => "Bearer $other->{access_token}"} => json => {post => {body => 'Not mine'}})
   ->status_is(200)->json_is('/post/body' => 'Edited root');
+$t->get_ok('/content?path=articles/1')->status_is(200)->json_is('/content/files/0' => 'example.txt');
+$t->get_ok('/content?path=../outside')->status_is(404);
+$t->get_ok('/task-content/100/zadani?path=problem.txt')->status_is(200)->content_is("problem\n");
+$t->get_ok('/task-content/100/zadani?path=../../../etc/passwd')->status_is(404);
+$t->post_ok('/content?path=uploads' => form => {file => {file => "$dir/upload.txt"}})->status_is(400);
+$t->post_ok('/content?path=uploads' => {Authorization => "Bearer $admin->{access_token}"} => form => {file => {file => "$dir/upload.txt"}})
+  ->status_is(200);
+$t->get_ok('/content?path=uploads')->status_is(200)->json_is('/content/files/0' => 'upload.txt');
+$t->delete_ok('/content?path=uploads/upload.txt' => {Authorization => "Bearer $admin->{access_token}"})->status_is(200)->json_is({});
 done_testing;

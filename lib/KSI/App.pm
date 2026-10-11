@@ -9,7 +9,11 @@ use KSI::Auth qw(check_password new_token utc_after);
 use POSIX qw(strftime);
 use Cwd qw(abs_path getcwd);
 use File::Spec;
+use File::Basename qw(basename dirname);
+use File::Path qw(make_path);
+use MIME::Types;
 use Mojo::JSON ();
+use Mojo::Asset::File;
 
 sub startup ($self) {
     $self->secrets([$ENV{MOJO_SECRET} // die 'Set MOJO_SECRET']);
@@ -463,6 +467,52 @@ sub startup ($self) {
         $c->db->do('DELETE FROM posts WHERE id = ?', undef, $post->{id});
         return $c->render(json => {});
     });
+    $r->any([qw(GET POST DELETE)], '/content')->to(cb => sub ($c) {
+        my $relative = $c->param('path') // '.';
+        if ($c->req->method eq 'GET') {
+            my $path = _safe_path($ENV{KSI_CONTENT_ROOT} // 'data/content', $relative);
+            return $c->rendered(404) unless defined $path;
+            return $c->render(json => {content => _content_json($relative)}) if -d $path;
+            return $c->render(json => {content => {id => $relative, files => [], dirs => []}}) unless -f $path;
+            $c->res->headers->content_type(_mime_type($path));
+            return _file_response($c, $path);
+        }
+        return _article_error($c, 400, '401', 'Unauthorized', 'Upravovat content může pouze organizátor.') unless _org($c);
+        if ($c->req->method eq 'POST') {
+            my $size = $c->req->headers->content_length;
+            return $c->rendered(411) unless defined $size && $size > 0;
+            return $c->rendered(413) if $size > 25 * 1024 * 1024;
+            my $dir = _safe_path($ENV{KSI_CONTENT_ROOT} // 'data/content', $relative, 1);
+            return $c->rendered(404) unless defined $dir;
+            make_path($dir) unless -d $dir;
+            $dir = _safe_path($ENV{KSI_CONTENT_ROOT} // 'data/content', $relative);
+            return $c->rendered(404) unless defined $dir && -d $dir;
+            my $uploads = $c->req->uploads;
+            return $c->rendered(400) unless @$uploads;
+            return $c->rendered(413) if @$uploads > 20;
+            for my $upload (@$uploads) {
+                my $name = basename($upload->filename // '');
+                return $c->rendered(400) unless length($name) && $name ne '.' && $name ne '..';
+                my $target = _safe_path($ENV{KSI_CONTENT_ROOT} // 'data/content', "$relative/$name", 1);
+                return $c->rendered(404) unless defined $target;
+                $upload->move_to($target);
+            }
+            return $c->render(json => {});
+        }
+        my $path = _safe_path($ENV{KSI_CONTENT_ROOT} // 'data/content', $relative);
+        return $c->rendered(404) unless defined $path && -f $path;
+        unlink $path or die "Cannot remove content file";
+        my $parent = dirname($path);
+        my $root = abs_path($ENV{KSI_CONTENT_ROOT} // 'data/content');
+        while ($parent ne $root && rmdir $parent) { $parent = dirname($parent) }
+        return $c->render(json => {});
+    });
+    $r->get('/taskContent/:id/:view')->to(cb => sub ($c) {
+        return _task_content($c, $c->param('id'), $c->param('view'));
+    });
+    $r->get('/task-content/:id/:view')->to(cb => sub ($c) {
+        return _task_content($c, $c->param('id'), $c->param('view'));
+    });
 }
 
 sub _admin ($c) {
@@ -514,7 +564,7 @@ sub _content_json ($path) {
     my $base = abs_path($ENV{KSI_CONTENT_ROOT} // File::Spec->catdir(getcwd(), 'data', 'content'));
     return $empty unless defined $base && defined $path && $path !~ m{(?:\A/|(?:\A|/)\.\.(?:/|\z))};
     my $dir = abs_path(File::Spec->catdir($base, split m{/}, $path));
-    return $empty unless defined $dir && index($dir, "$base/") == 0 && -d $dir;
+    return $empty unless defined $dir && ($dir eq $base || index($dir, "$base/") == 0) && -d $dir;
     opendir my $dh, $dir or return $empty;
     my @names = grep { $_ ne '.' && $_ ne '..' } readdir $dh;
     closedir $dh;
@@ -526,6 +576,53 @@ sub _content_json ($path) {
         push @dirs, $name if -d $child;
     }
     return {id => $path, files => \@files, dirs => \@dirs};
+}
+
+sub _safe_path ($root, $relative, $allow_missing = 0) {
+    return unless defined $relative && !File::Spec->file_name_is_absolute($relative);
+    return if grep { $_ eq '..' } File::Spec->splitdir($relative);
+    my $base = abs_path($root) // return;
+    my $candidate = File::Spec->catfile($base, $relative);
+    my $real = abs_path($candidate);
+    if (defined $real) {
+        return if $real ne $base && index($real, "$base/") != 0;
+        return $real;
+    }
+    return unless $allow_missing;
+    my $ancestor = dirname($candidate);
+    while (!-e $ancestor) {
+        my $parent = dirname($ancestor);
+        return if $parent eq $ancestor;
+        $ancestor = $parent;
+    }
+    my $real_ancestor = abs_path($ancestor) // return;
+    return if $real_ancestor ne $base && index($real_ancestor, "$base/") != 0;
+    my $tail = File::Spec->abs2rel($candidate, $ancestor);
+    return File::Spec->catfile($real_ancestor, $tail);
+}
+
+sub _mime_type ($path) {
+    my $type = MIME::Types->new->mimeTypeOf($path);
+    return $type ? $type->type : 'application/octet-stream';
+}
+
+sub _task_content ($c, $id, $view) {
+    my $user = $c->stash('user') // {};
+    return $c->rendered(400) unless defined $id && $id =~ /\A\d+\z/ && defined $view
+        && ($view eq 'icon' || $view =~ /\A(?:zadani|reseni)/);
+    my $path = $c->param('path');
+    return $c->rendered(400) unless defined $path;
+    my $root = $ENV{KSI_TASK_CONTENT_ROOT} // 'data/task-content';
+    my $base = File::Spec->catdir($id, basename($view));
+    my $file = _safe_path($root, "$base/$path");
+    return $c->rendered(404) unless defined $file && -f $file;
+    $c->res->headers->content_type(_mime_type($file));
+    return _file_response($c, $file);
+}
+
+sub _file_response ($c, $path) {
+    $c->res->content->asset(Mojo::Asset::File->new(path => $path));
+    return $c->rendered(200);
 }
 
 sub _thread_allowed ($c, $thread) {
