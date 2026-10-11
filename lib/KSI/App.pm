@@ -438,6 +438,31 @@ sub startup ($self) {
         return $c->render(json => {threadDetails => {id => 0 + $id, root_posts => \@root_posts},
             posts => [map {_post_json($_, $user, $visit, $posts)} @$posts]});
     });
+    $r->get('/posts/:id')->to(cb => sub ($c) {
+        return _get_post($c, $c->param('id'));
+    });
+    $r->put('/posts/:id')->to(cb => sub ($c) {
+        my $user = $c->stash('user');
+        return _get_post($c, $c->param('id')) unless $user;
+        my $body = $c->req->json;
+        my $data = ref($body) eq 'HASH' ? $body->{post} : undef;
+        return $c->rendered(400) unless ref($data) eq 'HASH' && defined $data->{body};
+        return $c->render(status => 413, json => {errors => [{status => '413', title => 'Payload too large', detail => 'Tělo příspěvku může mít maximálně 8000 znaků.'}]}) if length($data->{body}) > 8000;
+        my $post = $c->db->selectrow_hashref('SELECT id, thread, author FROM posts WHERE id = ?', undef, $c->param('id'));
+        return $c->rendered(404) unless $post;
+        return _get_post($c, $post->{id}) unless _org($c) || $post->{author} == $user->{user};
+        $c->db->do('UPDATE posts SET body = ? WHERE id = ?', undef, $data->{body}, $post->{id});
+        return _get_post($c, $post->{id});
+    });
+    $r->delete('/posts/:id')->to(cb => sub ($c) {
+        my $user = $c->stash('user');
+        return $c->rendered(400) unless $user;
+        my $post = $c->db->selectrow_hashref('SELECT id, author FROM posts WHERE id = ?', undef, $c->param('id'));
+        return $c->rendered(404) unless $post;
+        return $c->rendered(403) unless _org($c) || $post->{author} == $user->{user};
+        $c->db->do('DELETE FROM posts WHERE id = ?', undef, $post->{id});
+        return $c->render(json => {});
+    });
 }
 
 sub _admin ($c) {
@@ -540,6 +565,19 @@ sub _post_json ($post, $user, $visit, $posts) {
     return {id => 0 + $post->{id}, thread => 0 + $post->{thread}, author => 0 + $post->{author},
         body => $post->{body}, published_at => $published_at, reaction => \@reactions,
         is_new => $is_new ? Mojo::JSON->true : Mojo::JSON->false};
+}
+
+sub _get_post ($c, $id) {
+    return $c->rendered(404) unless defined $id && $id =~ /\A\d+\z/;
+    my $post = $c->db->selectrow_hashref('SELECT id, thread, author, body, published_at, parent FROM posts WHERE id = ?', undef, $id);
+    return $c->rendered(404) unless $post;
+    my $thread = $c->db->selectrow_hashref('SELECT id, public FROM threads WHERE id = ?', undef, $post->{thread});
+    return $c->rendered(404) unless $thread;
+    return $c->rendered(400) unless _thread_allowed($c, $thread);
+    my $user = $c->stash('user');
+    my $visit = $user ? $c->db->selectrow_hashref('SELECT last_visit, last_last_visit FROM threads_visits WHERE thread = ? AND user = ?', undef, $post->{thread}, $user->{user}) : undef;
+    my $posts = $c->db->selectall_arrayref('SELECT id, parent FROM posts WHERE thread = ?', {Slice => {}}, $post->{thread});
+    return $c->render(json => {post => _post_json($post, $user, $visit, $posts)});
 }
 
 sub _years ($c) {

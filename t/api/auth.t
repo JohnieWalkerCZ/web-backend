@@ -70,6 +70,8 @@ $dbh->do('INSERT INTO users (id, email, password, enabled) VALUES (?, ?, ?, ?)',
     undef, 8, 'disabled@example.test', hash_password('good-password'), 0);
 $dbh->do('INSERT INTO users (id, email, password, enabled, role) VALUES (?, ?, ?, ?, ?)',
     undef, 9, 'admin@example.test', hash_password('good-password'), 1, 'admin');
+$dbh->do('INSERT INTO users (id, email, password, enabled) VALUES (?, ?, ?, ?)',
+    undef, 10, 'other@example.test', hash_password('good-password'), 1);
 $dbh->do('INSERT INTO years VALUES (2025, ?, 0, 1.5)', undef, '2025/2026');
 $dbh->do('INSERT INTO waves VALUES (10, 2025, 1, "Wave one", 9, "2020-01-01 00:00:00")');
 $dbh->do('INSERT INTO waves VALUES (11, 2025, 2, "Wave two", 9, "2099-01-01 00:00:00")');
@@ -186,4 +188,17 @@ $t->post_ok('/threads' => {Authorization => "Bearer $rotated->{access_token}"} =
   ->status_is(200)->json_is('/thread/title' => 'Discussion');
 $t->post_ok('/threads' => {Authorization => "Bearer $rotated->{access_token}"} => json => {thread => {title => 'x' x 101}})
   ->status_is(413);
+$t->get_ok('/posts/1')->status_is(200)->json_is('/post/reaction' => [2])->json_is('/post/is_new' => 0);
+$t->get_ok('/posts/3')->status_is(400);
+$t->put_ok('/posts/1' => {Authorization => "Bearer $rotated->{access_token}"} => json => {post => {body => 'Edited root'}})
+  ->status_is(200)->json_is('/post/body' => 'Edited root');
+$t->put_ok('/posts/1' => {Authorization => "Bearer $rotated->{access_token}"} => json => {post => {body => 'x' x 8001}})
+  ->status_is(413);
+$t->delete_ok('/posts/2' => {Authorization => "Bearer $rotated->{access_token}"})->status_is(200)->json_is({});
+$t->post_ok('/auth' => form => {grant_type => 'password', username => 'other@example.test', password => 'good-password'})
+  ->status_is(200);
+my $other = $t->tx->res->json;
+$t->delete_ok('/posts/1' => {Authorization => "Bearer $other->{access_token}"})->status_is(403);
+$t->put_ok('/posts/1' => {Authorization => "Bearer $other->{access_token}"} => json => {post => {body => 'Not mine'}})
+  ->status_is(200)->json_is('/post/body' => 'Edited root');
 done_testing;
