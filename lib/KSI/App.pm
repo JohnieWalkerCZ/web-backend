@@ -112,6 +112,44 @@ sub startup ($self) {
         return $c->rendered(404) unless $year;
         return $c->render(json => {year => $year});
     });
+    $r->post('/years')->to(cb => sub ($c) {
+        return $c->rendered(400) unless _admin($c);
+        my $body = $c->req->json;
+        return $c->rendered(400) unless ref($body) eq 'HASH';
+        my $data = $body->{year};
+        return $c->rendered(400) unless ref($data) eq 'HASH';
+        my $dbh = $c->db;
+        eval {
+            $dbh->begin_work;
+            $dbh->do('INSERT INTO years (id, year, sealed, point_pad) VALUES (?, ?, ?, ?)', undef,
+                @$data{qw(index year sealed point_pad)});
+            for my $org (@{$data->{active_orgs} // []}) {
+                $dbh->do('INSERT INTO active_orgs (org, year) VALUES (?, ?)', undef, $org, $data->{index});
+            }
+            $dbh->commit;
+            1;
+        } or do {
+            my $error = $@ || 'Year creation failed';
+            eval { $dbh->rollback };
+            die $error;
+        };
+        my ($year) = grep { $_->{id} == $data->{index} } @{_years($c)};
+        return $c->render(json => {year => $year});
+    });
+    $r->delete('/years/:id')->to(cb => sub ($c) {
+        return $c->rendered(400) unless _admin($c);
+        my $id = $c->param('id');
+        return $c->rendered(404) unless $id =~ /\A\d+\z/;
+        my $dbh = $c->db;
+        return $c->rendered(404) unless $dbh->selectrow_array('SELECT 1 FROM years WHERE id = ?', undef, $id);
+        return $c->rendered(403) if $dbh->selectrow_array('SELECT 1 FROM waves WHERE year = ? LIMIT 1', undef, $id);
+        $dbh->do('DELETE FROM years WHERE id = ?', undef, $id);
+        return $c->render(json => {});
+    });
+}
+
+sub _admin ($c) {
+    return (($c->stash('user') // {})->{role} // '') eq 'admin';
 }
 
 sub _years ($c) {

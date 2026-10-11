@@ -34,10 +34,13 @@ $dbh->do(q{CREATE TABLE tasks (
 $dbh->do(q{CREATE TABLE modules (
     id INTEGER PRIMARY KEY, task INTEGER NOT NULL, max_points REAL, bonus INTEGER NOT NULL DEFAULT 0
 )});
+$dbh->do(q{CREATE TABLE active_orgs (org INTEGER NOT NULL, year INTEGER NOT NULL, PRIMARY KEY (org, year))});
 $dbh->do('INSERT INTO users (id, email, password, enabled) VALUES (?, ?, ?, ?)',
     undef, 7, 'person@example.test', hash_password('good-password'), 1);
 $dbh->do('INSERT INTO users (id, email, password, enabled) VALUES (?, ?, ?, ?)',
     undef, 8, 'disabled@example.test', hash_password('good-password'), 0);
+$dbh->do('INSERT INTO users (id, email, password, enabled, role) VALUES (?, ?, ?, ?, ?)',
+    undef, 9, 'admin@example.test', hash_password('good-password'), 1, 'admin');
 $dbh->do('INSERT INTO years VALUES (2025, ?, 0, 1.5)', undef, '2025/2026');
 $dbh->do('INSERT INTO waves VALUES (10, 2025, 1)');
 $dbh->do('INSERT INTO tasks VALUES (100, 10)');
@@ -70,4 +73,14 @@ $t->get_ok('/years')->status_is(200)->json_is('/years/0/sum_points' => 8)
 $t->get_ok('/years/2025')->status_is(200)->json_is('/year/sum_points' => 8);
 $t->get_ok('/years/9999')->status_is(404);
 $t->head_ok('/years')->status_is(200)->content_is('');
+$t->post_ok('/years' => json => {year => {index => 2026, year => '2026/2027', sealed => 0, point_pad => 0, active_orgs => [7]}})
+  ->status_is(400);
+$t->post_ok('/auth' => form => {grant_type => 'password', username => 'admin@example.test', password => 'good-password'})
+  ->status_is(200);
+my $admin = $t->tx->res->json;
+$t->post_ok('/years' => {Authorization => "Bearer $admin->{access_token}"} => json => {year => {index => 2026, year => '2026/2027', sealed => 0, point_pad => 0, active_orgs => [7]}})
+  ->status_is(200)->json_is('/year/index' => 2026)->json_is('/year/sum_points' => 0);
+$t->get_ok('/years/2026')->status_is(200)->json_is('/year/tasks_cnt' => 0);
+$t->delete_ok('/years/2025' => {Authorization => "Bearer $admin->{access_token}"})->status_is(403);
+$t->delete_ok('/years/2026' => {Authorization => "Bearer $admin->{access_token}"})->status_is(200)->json_is({});
 done_testing;
