@@ -4,6 +4,7 @@ use warnings;
 use Test::More;
 use Test::Mojo;
 use File::Temp qw(tempdir);
+use File::Path qw(make_path);
 use DBI;
 use lib 'lib';
 use KSI::Auth qw(hash_password);
@@ -12,6 +13,11 @@ my $dir = tempdir(CLEANUP => 1);
 my $dbfile = "$dir/test.sqlite";
 $ENV{SQL_ALCHEMY_URI} = "sqlite:///$dbfile";
 $ENV{MOJO_SECRET} = 'test-only-secret';
+$ENV{KSI_CONTENT_ROOT} = "$dir/content";
+make_path("$dir/content/articles/1");
+open my $content_file, '>', "$dir/content/articles/1/example.txt" or die $!;
+print {$content_file} "content\n";
+close $content_file;
 my $dbh = DBI->connect("dbi:SQLite:dbname=$dbfile", '', '', {RaiseError => 1});
 $dbh->do(q{CREATE TABLE users (
     id INTEGER PRIMARY KEY, email VARCHAR(50) UNIQUE NOT NULL,
@@ -41,6 +47,11 @@ $dbh->do(q{CREATE TABLE achievements (
     description TEXT, year INTEGER
 )});
 $dbh->do(q{CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT, secret INTEGER NOT NULL DEFAULT 0)});
+$dbh->do(q{CREATE TABLE articles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, author INTEGER NOT NULL, title TEXT NOT NULL,
+    body TEXT, picture TEXT, time_created TEXT NOT NULL, published INTEGER,
+    year INTEGER NOT NULL, resource TEXT
+)});
 $dbh->do('INSERT INTO users (id, email, password, enabled) VALUES (?, ?, ?, ?)',
     undef, 7, 'person@example.test', hash_password('good-password'), 1);
 $dbh->do('INSERT INTO users (id, email, password, enabled) VALUES (?, ?, ?, ?)',
@@ -55,6 +66,11 @@ $dbh->do('INSERT INTO tasks VALUES (101, 10)');
 $dbh->do('INSERT INTO modules (id, task, max_points, bonus) VALUES (1000, 100, 5, 0)');
 $dbh->do('INSERT INTO modules (id, task, max_points, bonus) VALUES (1001, 100, 3, 0)');
 $dbh->do('INSERT INTO modules (id, task, max_points, bonus) VALUES (1002, 100, 2, 1)');
+$dbh->do('INSERT INTO articles (author, title, body, time_created, published, year, resource) VALUES (9, ?, ?, ?, 1, 2025, ?)',
+    undef, 'Published article', 'Public body', '2020-01-01 12:00:00', 'articles/1');
+$dbh->do('INSERT INTO articles (author, title, body, time_created, published, year) VALUES (9, ?, ?, ?, 0, 2025)',
+    undef, 'Draft article', 'Private body', '2021-01-01 12:00:00');
+$dbh->do('UPDATE articles SET resource = ? WHERE title = ?', undef, '../../outside', 'Draft article');
 $dbh->disconnect;
 
 my $t = Test::Mojo->new('KSI::App');
@@ -117,4 +133,20 @@ $t->put_ok('/achievements/' . $achievement->{id} => {Authorization => "Bearer $a
   ->status_is(200)->json_is('/achievement/persistent' => 1)->json_is('/achievement/year' => undef);
 $t->get_ok('/achievements')->status_is(200)->json_is('/achievements/0/title' => 'Persistent Prize');
 $t->delete_ok('/achievements/' . $achievement->{id} => {Authorization => "Bearer $admin->{access_token}"})->status_is(200)->json_is({});
+$t->get_ok('/articles')->status_is(200)->json_is('/meta/total' => 1)
+  ->json_is('/articles/0/title' => 'Published article')->json_is('/articles/0/picture' => 'img/box-ksi.svg');
+$t->get_ok('/articles/2')->status_is(400);
+$t->get_ok('/articles/999')->status_is(404)->json_is('/errors/0/status' => '404');
+$t->post_ok('/articles' => json => {article => {title => 'No access'}})
+  ->status_is(400)->json_is('/errors/0/title' => 'Unauthorized');
+$t->get_ok('/articles' => {Authorization => "Bearer $admin->{access_token}"})->status_is(200)
+  ->json_is('/meta/total' => 2)->json_is('/contents/0/files' => [])
+  ->json_is('/contents/1/id' => 'articles/1')->json_is('/contents/1/files/0' => 'example.txt');
+$t->get_ok('/articles?_start=0&_limit=1' => {Authorization => "Bearer $admin->{access_token}"})->status_is(200)
+  ->json_is('/meta/total' => 2)->json_is('/articles/0/title' => 'Draft article');
+$t->post_ok('/articles' => {Authorization => "Bearer $admin->{access_token}"} => json => {article => {title => 'New article', body => 'New body', published => 1, time_published => '2025-02-03T04:05:06Z', picture => 'new.svg'}})
+  ->status_is(200)->json_is('/article/title' => 'New article')->json_is('/article/content' => 'articles/3');
+$t->put_ok('/articles/3' => {Authorization => "Bearer $admin->{access_token}"} => json => {article => {title => 'Changed article', body => 'Changed body', published => 1, time_published => '2025-02-04T04:05:06Z', picture => 'new.svg'}})
+  ->status_is(200)->json_is('/article/title' => 'Changed article')->json_is('/article/time_published' => '2025-02-04T04:05:06');
+$t->delete_ok('/articles/3' => {Authorization => "Bearer $admin->{access_token}"})->status_is(200)->json_is({});
 done_testing;

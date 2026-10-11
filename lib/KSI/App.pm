@@ -7,6 +7,9 @@ use parent 'Mojolicious';
 use KSI::DB;
 use KSI::Auth qw(check_password new_token utc_after);
 use POSIX qw(strftime);
+use Cwd qw(abs_path getcwd);
+use File::Spec;
+use Mojo::JSON ();
 
 sub startup ($self) {
     $self->secrets([$ENV{MOJO_SECRET} // die 'Set MOJO_SECRET']);
@@ -288,6 +291,79 @@ sub startup ($self) {
         $c->db->do('DELETE FROM achievements WHERE id = ?', undef, $id);
         return $c->render(json => {});
     });
+    $r->get('/articles')->to(cb => sub ($c) {
+        my $user = $c->stash('user') // {};
+        my $where = 'year = ?';
+        my @bind = ($c->stash('year') // 0);
+        if (($user->{role} // '') =~ /\A(?:|participant|participant_hidden)\z/) {
+            $where .= ' AND published = 1';
+        }
+        my ($count) = $c->db->selectrow_array("SELECT COUNT(*) FROM articles WHERE $where", undef, @bind);
+        my $limit = $c->param('_limit');
+        my $start = $c->param('_start');
+        my $paginate = defined $limit && defined $start;
+        return $c->rendered(400) if $paginate && ($limit !~ /\A\d+\z/ || $start !~ /\A\d+\z/);
+        my $sql = "SELECT id, title, body, time_created, picture, published, author, resource, year FROM articles WHERE $where ORDER BY time_created DESC";
+        $sql .= ' LIMIT ? OFFSET ?' if $paginate;
+        my @article_bind = @bind;
+        push @article_bind, $limit, $start if $paginate;
+        my $rows = $c->db->selectall_arrayref($sql, {Slice => {}}, @article_bind);
+        my $contents = _org($c) ? [map {_content_json($_->{resource})} grep {defined $_->{resource}} @$rows] : [];
+        return $c->render(json => {articles => [map {_article_json($_)} @$rows], meta => {total => 0 + $count}, contents => $contents});
+    });
+    $r->get('/articles/:id')->to(cb => sub ($c) {
+        my $id = $c->param('id');
+        return _article_error($c, 404, '404', 'Not Found', 'Článek s tímto ID neexistuje.') unless $id =~ /\A\d+\z/;
+        my $row = $c->db->selectrow_hashref('SELECT id, title, body, time_created, picture, published, author, resource, year FROM articles WHERE id = ?', undef, $id);
+        return _article_error($c, 404, '404', 'Not Found', 'Článek s tímto ID neexistuje.') unless $row;
+        return _article_error($c, 400, '401', 'Unauthorized', 'Přístup odepřen.')
+            if !$row->{published} && !_org($c);
+        return $c->render(json => {article => _article_json($row),
+            contents => $row->{resource} && _org($c) ? [_content_json($row->{resource})] : []});
+    });
+    $r->post('/articles')->to(cb => sub ($c) {
+        return _article_error($c, 400, '401', 'Unauthorized', 'Přidat článek může pouze organizátor.') unless _org($c);
+        my $body = $c->req->json;
+        my $data = ref($body) eq 'HASH' ? $body->{article} : undef;
+        return $c->rendered(400) unless ref($data) eq 'HASH'
+            && defined $data->{title} && exists $data->{body}
+            && exists $data->{published} && defined $data->{time_published};
+        my $time = _sql_time($data->{time_published});
+        return $c->rendered(400) unless defined $time;
+        my $dbh = $c->db;
+        $dbh->do('INSERT INTO articles (author, title, body, published, year, time_created, picture) VALUES (?, ?, ?, ?, ?, ?, ?)',
+            undef, $c->stash('user')->{user}, @$data{qw(title body published)}, $c->stash('year'), $time, $data->{picture});
+        my $id = $dbh->last_insert_id(undef, undef, 'articles', 'id');
+        $dbh->do('UPDATE articles SET resource = ? WHERE id = ?', undef, "articles/$id", $id);
+        my $row = $dbh->selectrow_hashref('SELECT id, title, body, time_created, picture, published, author, resource, year FROM articles WHERE id = ?', undef, $id);
+        return $c->render(json => {article => _article_json($row)});
+    });
+    $r->put('/articles/:id')->to(cb => sub ($c) {
+        return _article_error($c, 400, '401', 'Unauthorized', 'Upravit článek může pouze organizátor.') unless _org($c);
+        my $id = $c->param('id');
+        return _article_error($c, 404, '404', 'Not Found', 'Článek s tímto ID neexistuje.') unless $id =~ /\A\d+\z/;
+        return _article_error($c, 404, '404', 'Not Found', 'Článek s tímto ID neexistuje.')
+            unless $c->db->selectrow_array('SELECT 1 FROM articles WHERE id = ?', undef, $id);
+        my $body = $c->req->json;
+        my $data = ref($body) eq 'HASH' ? $body->{article} : undef;
+        return $c->rendered(400) unless ref($data) eq 'HASH'
+            && defined $data->{title} && exists $data->{body}
+            && exists $data->{published} && defined $data->{time_published};
+        my $time = _sql_time($data->{time_published});
+        return $c->rendered(400) unless defined $time;
+        $c->db->do('UPDATE articles SET title = ?, body = ?, published = ?, time_created = ?, picture = ? WHERE id = ?',
+            undef, @$data{qw(title body published)}, $time, $data->{picture}, $id);
+        my $row = $c->db->selectrow_hashref('SELECT id, title, body, time_created, picture, published, author, resource, year FROM articles WHERE id = ?', undef, $id);
+        return $c->render(json => {article => _article_json($row), contents => $row->{resource} ? [_content_json($row->{resource})] : []});
+    });
+    $r->delete('/articles/:id')->to(cb => sub ($c) {
+        return _article_error($c, 400, '401', 'Unauthorized', 'Smazat článek může pouze organizátor.') unless _org($c);
+        my $id = $c->param('id');
+        return _article_error($c, 404, '404', 'Not Found', 'Článek s tímto ID neexistuje.') unless $id =~ /\A\d+\z/;
+        my $deleted = $c->db->do('DELETE FROM articles WHERE id = ?', undef, $id);
+        return _article_error($c, 404, '404', 'Not Found', 'Článek s tímto ID neexistuje.') unless $deleted && $deleted == 1;
+        return $c->render(json => {});
+    });
 }
 
 sub _admin ($c) {
@@ -312,6 +388,45 @@ sub _achievement_json ($row) {
         picture => $row->{picture}, description => $row->{description},
         persistent => defined $row->{year} ? Mojo::JSON->false : Mojo::JSON->true,
         year => defined $row->{year} ? 0 + $row->{year} : undef};
+}
+
+sub _article_json ($row) {
+    my $published_at = $row->{time_created};
+    $published_at =~ s/ /T/ if defined $published_at;
+    return {id => 0 + $row->{id}, title => $row->{title}, body => $row->{body},
+        time_published => $published_at, picture => $row->{picture} || 'img/box-ksi.svg',
+        published => $row->{published} ? Mojo::JSON->true : Mojo::JSON->false,
+        author => 0 + $row->{author}, content => $row->{resource}, year => 0 + $row->{year}};
+}
+
+sub _article_error ($c, $http_status, $status, $title, $detail) {
+    return $c->render(status => $http_status,
+        json => {errors => [{status => $status, title => $title, detail => $detail}]});
+}
+
+sub _sql_time ($value) {
+    return unless defined $value;
+    return unless $value =~ /\A(\d{4}-\d\d-\d\d)[T ](\d\d:\d\d:\d\d)(?:\.\d+)?(?:Z|[+-]\d\d:?\d\d)?\z/;
+    return "$1 $2";
+}
+
+sub _content_json ($path) {
+    my $empty = {id => $path, files => [], dirs => []};
+    my $base = abs_path($ENV{KSI_CONTENT_ROOT} // File::Spec->catdir(getcwd(), 'data', 'content'));
+    return $empty unless defined $base && defined $path && $path !~ m{(?:\A/|(?:\A|/)\.\.(?:/|\z))};
+    my $dir = abs_path(File::Spec->catdir($base, split m{/}, $path));
+    return $empty unless defined $dir && index($dir, "$base/") == 0 && -d $dir;
+    opendir my $dh, $dir or return $empty;
+    my @names = grep { $_ ne '.' && $_ ne '..' } readdir $dh;
+    closedir $dh;
+    my (@files, @dirs);
+    for my $name (@names) {
+        my $child = abs_path(File::Spec->catfile($dir, $name));
+        next unless defined $child && index($child, "$base/") == 0;
+        push @files, $name if -f $child;
+        push @dirs, $name if -d $child;
+    }
+    return {id => $path, files => \@files, dirs => \@dirs};
 }
 
 sub _years ($c) {
