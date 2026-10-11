@@ -167,6 +167,46 @@ sub startup ($self) {
         return $c->rendered(404) unless $wave;
         return $c->render(json => {wave => $wave});
     });
+    $r->post('/waves')->to(cb => sub ($c) {
+        my $user = $c->stash('user') // {};
+        return $c->rendered(400) unless ($user->{role} // '') eq 'admin';
+        my $body = $c->req->json;
+        my $data = ref($body) eq 'HASH' ? $body->{wave} : undef;
+        return $c->rendered(400) unless ref($data) eq 'HASH' && defined $data->{time_published};
+        my $dbh = $c->db;
+        $dbh->do('INSERT INTO waves (year, `index`, caption, garant, time_published) VALUES (?, ?, ?, ?, ?)',
+            undef, $c->stash('year'), @$data{qw(index caption garant time_published)});
+        my $id = $dbh->last_insert_id(undef, undef, 'waves', 'id');
+        my ($wave) = @{_waves($c, undef, $id)};
+        return $c->render(json => {wave => $wave});
+    });
+    $r->put('/waves/:id')->to(cb => sub ($c) {
+        my $user = $c->stash('user') // {};
+        return $c->rendered(400) unless ($user->{role} // '') =~ /\A(?:admin|org)\z/;
+        my $id = $c->param('id');
+        return $c->rendered(404) unless $id =~ /\A\d+\z/;
+        my ($wave) = @{_waves($c, undef, $id)};
+        return $c->rendered(404) unless $wave;
+        return $c->rendered(400) if ($user->{role} // '') ne 'admin' && $user->{user} != $wave->{garant};
+        my $body = $c->req->json;
+        my $data = ref($body) eq 'HASH' ? $body->{wave} : undef;
+        return $c->rendered(400) unless ref($data) eq 'HASH' && exists $data->{index}
+            && exists $data->{caption} && exists $data->{garant};
+        $c->db->do('UPDATE waves SET `index` = ?, caption = ?, garant = ?, time_published = ? WHERE id = ?',
+            undef, @$data{qw(index caption garant)}, $data->{time_published} || $wave->{time_published}, $id);
+        my ($updated) = @{_waves($c, undef, $id)};
+        return $c->render(json => {wave => $updated});
+    });
+    $r->delete('/waves/:id')->to(cb => sub ($c) {
+        my $user = $c->stash('user') // {};
+        return $c->rendered(400) unless ($user->{role} // '') eq 'admin';
+        my $id = $c->param('id');
+        return $c->rendered(404) unless $id =~ /\A\d+\z/;
+        return $c->rendered(404) unless $c->db->selectrow_array('SELECT 1 FROM waves WHERE id = ?', undef, $id);
+        return $c->rendered(403) if $c->db->selectrow_array('SELECT 1 FROM tasks WHERE wave = ? LIMIT 1', undef, $id);
+        $c->db->do('DELETE FROM waves WHERE id = ?', undef, $id);
+        return $c->render(json => {});
+    });
 }
 
 sub _admin ($c) {
