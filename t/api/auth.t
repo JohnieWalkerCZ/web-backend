@@ -36,7 +36,7 @@ $dbh->do(q{CREATE TABLE waves (
     caption TEXT, garant INTEGER NOT NULL, time_published TEXT NOT NULL
 )});
 $dbh->do(q{CREATE TABLE tasks (
-    id INTEGER PRIMARY KEY, wave INTEGER NOT NULL
+    id INTEGER PRIMARY KEY, wave INTEGER NOT NULL, thread INTEGER
 )});
 $dbh->do(q{CREATE TABLE modules (
     id INTEGER PRIMARY KEY, task INTEGER NOT NULL, max_points REAL, bonus INTEGER NOT NULL DEFAULT 0
@@ -52,6 +52,18 @@ $dbh->do(q{CREATE TABLE articles (
     body TEXT, picture TEXT, time_created TEXT NOT NULL, published INTEGER,
     year INTEGER NOT NULL, resource TEXT
 )});
+$dbh->do(q{CREATE TABLE threads (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, public INTEGER NOT NULL DEFAULT 1, year INTEGER NOT NULL
+)});
+$dbh->do(q{CREATE TABLE posts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, thread INTEGER NOT NULL, author INTEGER NOT NULL,
+    body TEXT NOT NULL, published_at TEXT NOT NULL, parent INTEGER
+)});
+$dbh->do(q{CREATE TABLE threads_visits (
+    thread INTEGER NOT NULL, user INTEGER NOT NULL, last_visit TEXT NOT NULL,
+    last_last_visit TEXT, PRIMARY KEY (thread, user)
+)});
+$dbh->do(q{CREATE TABLE solution_comments (thread INTEGER NOT NULL, user INTEGER NOT NULL, task INTEGER NOT NULL, PRIMARY KEY (thread, user, task))});
 $dbh->do('INSERT INTO users (id, email, password, enabled) VALUES (?, ?, ?, ?)',
     undef, 7, 'person@example.test', hash_password('good-password'), 1);
 $dbh->do('INSERT INTO users (id, email, password, enabled) VALUES (?, ?, ?, ?)',
@@ -61,8 +73,8 @@ $dbh->do('INSERT INTO users (id, email, password, enabled, role) VALUES (?, ?, ?
 $dbh->do('INSERT INTO years VALUES (2025, ?, 0, 1.5)', undef, '2025/2026');
 $dbh->do('INSERT INTO waves VALUES (10, 2025, 1, "Wave one", 9, "2020-01-01 00:00:00")');
 $dbh->do('INSERT INTO waves VALUES (11, 2025, 2, "Wave two", 9, "2099-01-01 00:00:00")');
-$dbh->do('INSERT INTO tasks VALUES (100, 10)');
-$dbh->do('INSERT INTO tasks VALUES (101, 10)');
+$dbh->do('INSERT INTO tasks (id, wave, thread) VALUES (100, 10, 22)');
+$dbh->do('INSERT INTO tasks (id, wave, thread) VALUES (101, 10, 22)');
 $dbh->do('INSERT INTO modules (id, task, max_points, bonus) VALUES (1000, 100, 5, 0)');
 $dbh->do('INSERT INTO modules (id, task, max_points, bonus) VALUES (1001, 100, 3, 0)');
 $dbh->do('INSERT INTO modules (id, task, max_points, bonus) VALUES (1002, 100, 2, 1)');
@@ -71,6 +83,12 @@ $dbh->do('INSERT INTO articles (author, title, body, time_created, published, ye
 $dbh->do('INSERT INTO articles (author, title, body, time_created, published, year) VALUES (9, ?, ?, ?, 0, 2025)',
     undef, 'Draft article', 'Private body', '2021-01-01 12:00:00');
 $dbh->do('UPDATE articles SET resource = ? WHERE title = ?', undef, '../../outside', 'Draft article');
+$dbh->do('INSERT INTO threads (id, title, public, year) VALUES (20, ?, 1, 2025)', undef, 'Public thread');
+$dbh->do('INSERT INTO threads (id, title, public, year) VALUES (21, ?, 0, 2025)', undef, 'Private thread');
+$dbh->do('INSERT INTO threads (id, title, public, year) VALUES (22, ?, 1, 2025)', undef, 'Task thread');
+$dbh->do('INSERT INTO posts (id, thread, author, body, published_at, parent) VALUES (1, 20, 7, ?, ?, NULL)', undef, 'Root post', '2020-01-01 00:00:00');
+$dbh->do('INSERT INTO posts (id, thread, author, body, published_at, parent) VALUES (2, 20, 7, ?, ?, 1)', undef, 'Reaction', '2020-01-02 00:00:00');
+$dbh->do('INSERT INTO posts (id, thread, author, body, published_at, parent) VALUES (3, 21, 7, ?, ?, NULL)', undef, 'Private post', '2020-01-03 00:00:00');
 $dbh->disconnect;
 
 my $t = Test::Mojo->new('KSI::App');
@@ -91,6 +109,7 @@ $t->post_ok('/auth' => form => {grant_type => 'password', username => 'person@ex
 my $second = $t->tx->res->json;
 $t->post_ok('/auth' => form => {grant_type => 'refresh_token', refresh_token => $second->{refresh_token}})
   ->status_is(200)->json_has('/access_token')->json_is('/token_type' => 'Bearer');
+my $rotated = $t->tx->res->json;
 $t->post_ok('/auth' => form => {grant_type => 'refresh_token', refresh_token => $second->{refresh_token}})
   ->status_is(400)->json_is('/error' => 'unauthorized_client');
 $t->get_ok('/years')->status_is(200)->json_is('/years/0/sum_points' => 8)
@@ -149,4 +168,22 @@ $t->post_ok('/articles' => {Authorization => "Bearer $admin->{access_token}"} =>
 $t->put_ok('/articles/3' => {Authorization => "Bearer $admin->{access_token}"} => json => {article => {title => 'Changed article', body => 'Changed body', published => 1, time_published => '2025-02-04T04:05:06Z', picture => 'new.svg'}})
   ->status_is(200)->json_is('/article/title' => 'Changed article')->json_is('/article/time_published' => '2025-02-04T04:05:06');
 $t->delete_ok('/articles/3' => {Authorization => "Bearer $admin->{access_token}"})->status_is(200)->json_is({});
+$t->get_ok('/threads')->status_is(200)->json_is('/threads/0/id' => 20);
+$t->get_ok('/threads?wave=10')->status_is(200)->json_is('/threads/0/id' => 22);
+$t->get_ok('/threads/20')->status_is(200)->json_is('/thread/posts_count' => 2)->json_is('/thread/unread' => 2);
+$t->get_ok('/threads/21')->status_is(400);
+$t->put_ok('/threads/20' => {Authorization => "Bearer $rotated->{access_token}"})->status_is(200)->json_is({});
+$t->get_ok('/threads/20' => {Authorization => "Bearer $rotated->{access_token}"})->status_is(200)->json_is('/thread/unread' => 0);
+$t->get_ok('/threadDetails/20' => {Authorization => "Bearer $rotated->{access_token}"})->status_is(200)
+  ->json_is('/threadDetails/root_posts' => [1])->json_is('/posts/0/reaction' => [2])->json_is('/posts/0/is_new' => 1);
+$t->put_ok('/threads/20' => {Authorization => "Bearer $rotated->{access_token}"})->status_is(200);
+$t->get_ok('/threadDetails/20' => {Authorization => "Bearer $rotated->{access_token}"})->status_is(200)->json_is('/posts/0/is_new' => 0);
+$dbh = DBI->connect("dbi:SQLite:dbname=$dbfile", '', '', {RaiseError => 1});
+$dbh->do('INSERT INTO solution_comments (thread, user, task) VALUES (21, 7, 100)');
+$dbh->disconnect;
+$t->get_ok('/threads/21' => {Authorization => "Bearer $rotated->{access_token}"})->status_is(200);
+$t->post_ok('/threads' => {Authorization => "Bearer $rotated->{access_token}"} => json => {thread => {title => 'Discussion'}})
+  ->status_is(200)->json_is('/thread/title' => 'Discussion');
+$t->post_ok('/threads' => {Authorization => "Bearer $rotated->{access_token}"} => json => {thread => {title => 'x' x 101}})
+  ->status_is(413);
 done_testing;

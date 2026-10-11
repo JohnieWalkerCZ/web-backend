@@ -364,6 +364,80 @@ sub startup ($self) {
         return _article_error($c, 404, '404', 'Not Found', 'Článek s tímto ID neexistuje.') unless $deleted && $deleted == 1;
         return $c->render(json => {});
     });
+    $r->get('/threads')->to(cb => sub ($c) {
+        my $wave = $c->param('wave');
+        return $c->rendered(400) if defined $wave && $wave ne '' && $wave !~ /\A\d+\z/;
+        my $year = $c->stash('year') // 0;
+        my $rows;
+        if ($wave) {
+            $rows = $c->db->selectall_arrayref(q{
+                SELECT DISTINCT th.id, th.title, th.year FROM threads th
+                JOIN tasks task ON task.thread = th.id
+                WHERE th.public = 1 AND th.year = ? AND task.wave = ? ORDER BY th.id DESC
+            }, {Slice => {}}, $year, $wave);
+        }
+        else {
+            $rows = $c->db->selectall_arrayref(q{
+                SELECT th.id, th.title, th.year FROM threads th
+                LEFT JOIN tasks task ON task.thread = th.id
+                WHERE th.public = 1 AND th.year = ? AND task.id IS NULL ORDER BY th.id DESC
+            }, {Slice => {}}, $year);
+        }
+        return $c->render(json => {threads => [map {_thread_json($c, $_)} @$rows]});
+    });
+    $r->post('/threads')->to(cb => sub ($c) {
+        my $user = $c->stash('user');
+        return $c->rendered(400) unless $user;
+        my ($sealed) = $c->db->selectrow_array('SELECT sealed FROM years WHERE id = ?', undef, $c->stash('year') // 0);
+        return $c->render(status => 403, json => {errors => [{status => '403', title => 'Forbidden', detail => 'Ročník zapečetěn.'}]}) if $sealed;
+        my $body = $c->req->json;
+        my $data = ref($body) eq 'HASH' ? $body->{thread} : undef;
+        return $c->rendered(400) unless ref($data) eq 'HASH' && defined $data->{title};
+        return $c->render(status => 413, json => {errors => [{status => '413', title => 'Payload too large', detail => 'Název vlákna může mít maximálně 100 znaků.'}]}) if length($data->{title}) > 100;
+        my $dbh = $c->db;
+        $dbh->do('INSERT INTO threads (title, public, year) VALUES (?, ?, ?)', undef,
+            $data->{title}, exists $data->{public} ? !!$data->{public} : 1, $c->stash('year'));
+        my $id = $dbh->last_insert_id(undef, undef, 'threads', 'id');
+        my $row = $dbh->selectrow_hashref('SELECT id, title, year FROM threads WHERE id = ?', undef, $id);
+        return $c->render(json => {thread => _thread_json($c, $row)});
+    });
+    $r->get('/threads/:id')->to(cb => sub ($c) {
+        my $id = $c->param('id');
+        return $c->rendered(404) unless $id =~ /\A\d+\z/;
+        my $row = $c->db->selectrow_hashref('SELECT id, title, year, public FROM threads WHERE id = ?', undef, $id);
+        return $c->render(status => 404, json => {errors => [{status => '404', title => 'Not Found', detail => 'Toto vlákno neexistuje.'}]}) unless $row;
+        return $c->render(status => 400, json => {errors => [{status => '401', title => 'Unauthorized', detail => 'Přístup k vláknu odepřen.'}]})
+            unless _thread_allowed($c, $row);
+        return $c->render(json => {thread => _thread_json($c, $row)});
+    });
+    $r->put('/threads/:id')->to(cb => sub ($c) {
+        my $user = $c->stash('user');
+        return $c->rendered(200) unless $user;
+        my $id = $c->param('id');
+        return $c->rendered(200) unless $id =~ /\A\d+\z/
+            && $c->db->selectrow_array('SELECT 1 FROM threads WHERE id = ?', undef, $id);
+        my $dbh = $c->db;
+        my $visit = $dbh->selectrow_hashref('SELECT last_visit FROM threads_visits WHERE thread = ? AND user = ?', undef, $id, $user->{user});
+        if ($visit) {
+            $dbh->do('UPDATE threads_visits SET last_last_visit = last_visit, last_visit = CURRENT_TIMESTAMP WHERE thread = ? AND user = ?', undef, $id, $user->{user});
+        }
+        else {
+            $dbh->do('INSERT INTO threads_visits (thread, user, last_visit) VALUES (?, ?, CURRENT_TIMESTAMP)', undef, $id, $user->{user});
+        }
+        return $c->render(json => {});
+    });
+    $r->get('/threadDetails/:id')->to(cb => sub ($c) {
+        my $id = $c->param('id');
+        return $c->rendered(400) unless $id =~ /\A\d+\z/;
+        my $thread = $c->db->selectrow_hashref('SELECT id, title, year, public FROM threads WHERE id = ?', undef, $id);
+        return $c->rendered(400) unless $thread && _thread_allowed($c, $thread);
+        my $user = $c->stash('user');
+        my $visit = $user ? $c->db->selectrow_hashref('SELECT last_visit, last_last_visit FROM threads_visits WHERE thread = ? AND user = ?', undef, $id, $user->{user}) : undef;
+        my $posts = $c->db->selectall_arrayref('SELECT id, thread, author, body, published_at, parent FROM posts WHERE thread = ? ORDER BY id', {Slice => {}}, $id);
+        my @root_posts = map {0 + $_->{id}} grep {!defined $_->{parent}} @$posts;
+        return $c->render(json => {threadDetails => {id => 0 + $id, root_posts => \@root_posts},
+            posts => [map {_post_json($_, $user, $visit, $posts)} @$posts]});
+    });
 }
 
 sub _admin ($c) {
@@ -427,6 +501,45 @@ sub _content_json ($path) {
         push @dirs, $name if -d $child;
     }
     return {id => $path, files => \@files, dirs => \@dirs};
+}
+
+sub _thread_allowed ($c, $thread) {
+    return 1 if $thread->{public};
+    my $user = $c->stash('user') // {};
+    return 1 if ($user->{role} // '') =~ /\A(?:admin|org)\z/;
+    return 0 unless $user->{user};
+    return $c->db->selectrow_array('SELECT 1 FROM solution_comments WHERE thread = ? AND user = ? LIMIT 1',
+        undef, $thread->{id}, $user->{user}) ? 1 : 0;
+}
+
+sub _thread_json ($c, $thread) {
+    my ($posts) = $c->db->selectrow_array('SELECT COUNT(*) FROM posts WHERE thread = ?', undef, $thread->{id});
+    my $user = $c->stash('user');
+    my $unread = $posts;
+    if ($user) {
+        my ($last_visit) = $c->db->selectrow_array('SELECT last_visit FROM threads_visits WHERE thread = ? AND user = ?',
+            undef, $thread->{id}, $user->{user});
+        if (defined $last_visit) {
+            ($unread) = $c->db->selectrow_array('SELECT COUNT(*) FROM posts WHERE thread = ? AND published_at > ?',
+                undef, $thread->{id}, $last_visit);
+        }
+    }
+    return {id => 0 + $thread->{id}, title => $thread->{title}, unread => 0 + $unread,
+        posts_count => 0 + $posts, details => 0 + $thread->{id}, year => 0 + $thread->{year}};
+}
+
+sub _post_json ($post, $user, $visit, $posts) {
+    my @reactions = map {0 + $_->{id}} grep {defined $_->{parent} && $_->{parent} == $post->{id}} @$posts;
+    my $is_new = 0;
+    if ($user) {
+        $is_new = !defined $visit || !defined $visit->{last_last_visit}
+            || $visit->{last_last_visit} lt $post->{published_at};
+    }
+    my $published_at = $post->{published_at};
+    $published_at =~ s/ /T/ if defined $published_at;
+    return {id => 0 + $post->{id}, thread => 0 + $post->{thread}, author => 0 + $post->{author},
+        body => $post->{body}, published_at => $published_at, reaction => \@reactions,
+        is_new => $is_new ? Mojo::JSON->true : Mojo::JSON->false};
 }
 
 sub _years ($c) {
